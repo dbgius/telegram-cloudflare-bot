@@ -1,26 +1,30 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
-✨ ENHANCED SUBSCRIPTION CODE BOT - WEBHOOK VERSION ✨
-Cloudflare Workers compatible webhook-based bot.
+✨ ENHANCED SUBSCRIPTION CODE BOT - PROFESSIONAL VERSION ✨
+Improved with better structure, ban/unban system, and enhanced admin panel.
 """
 
 import asyncio
 import logging
 import re
-import os
+import json
 import time
+import pickle
+import os
 from typing import Dict, Optional, Tuple, List, Any, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
-from datetime import datetime
-from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
 
 # Third-party imports
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
 from telegram.ext import (
     Application,
@@ -30,29 +34,22 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.constants import ParseMode
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-import uvicorn
+from telegram.constants import ParseMode, ChatAction
 
 # ==================== ENHANCED CONFIGURATION ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required")
+BOT_TOKEN = "8278734441:AAEqPI3swV6L0aLTncKXEA_ivvYOFM3zhz8"
+ADMIN_CHAT_IDS = {7853409680}  # ⚠️ REPLACE WITH ACTUAL IDs
 
-# Admin IDs - can be comma-separated in env var
-ADMIN_IDS_STR = os.getenv("ADMIN_CHAT_IDS", "7853409680")
-ADMIN_CHAT_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()}
-
-# Payment Wallets (⚠️ REPLACE WITH ACTUAL ADDRESSES from env)
+# Payment Wallets (⚠️ REPLACE WITH ACTUAL ADDRESSES)
 WALLETS = {
-    "USDT_TRC20": os.getenv("WALLET_USDT_TRC20", "TXYZabc123..."),
-    "USDT_BEP20": os.getenv("WALLET_USDT_BEP20", "0xABCdef456...")
+    "USDT_TRC20": "TXYZabc123...",
+    "USDT_BEP20": "0xABCdef456..."
 }
 
 # Bot Settings
 SCREENSHOT_TIMEOUT = 300
 ORDER_EXPIRY = 3600
+DATA_FILE = "bot_data.pkl"  # File for persisting data
 
 # ==================== ENHANCED DATA STRUCTURES ====================
 class Product(Enum):
@@ -104,35 +101,72 @@ class Order:
     def description(self) -> str:
         return f"{self.product.value['emoji']} {self.product.value['name']} (${self.amount}) via {self.network}"
 
-# ==================== IN-MEMORY DATA MANAGER ====================
-class InMemoryDataManager:
+# ==================== DATA MANAGER ====================
+class DataManager:
     def __init__(self):
         self.user_orders: Dict[int, Order] = {}
         self.admin_pending: Dict[int, int] = {}
         self.banned_users: Set[int] = set()
+        self.data_file = DATA_FILE
         
+    def save_data(self):
+        """Save all data to file"""
+        data = {
+            'user_orders': self.user_orders,
+            'banned_users': list(self.banned_users)
+        }
+        try:
+            with open(self.data_file, 'wb') as f:
+                pickle.dump(data, f)
+            logger.info(f"Data saved successfully: {len(self.user_orders)} orders, {len(self.banned_users)} banned users")
+        except Exception as e:
+            logger.error(f"Failed to save data: {e}")
+    
+    def load_data(self):
+        """Load data from file"""
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'rb') as f:
+                    data = pickle.load(f)
+                self.user_orders = data.get('user_orders', {})
+                self.banned_users = set(data.get('banned_users', []))
+                logger.info(f"Data loaded: {len(self.user_orders)} orders, {len(self.banned_users)} banned users")
+            except Exception as e:
+                logger.error(f"Failed to load data: {e}")
+                self.user_orders = {}
+                self.banned_users = set()
+        else:
+            logger.info("No existing data file, starting fresh")
+    
     def add_order(self, order: Order):
         """Add new order"""
         self.user_orders[order.user_id] = order
+        self.save_data()
     
     def update_order_status(self, user_id: int, status: OrderStatus):
         """Update order status"""
         if user_id in self.user_orders:
             self.user_orders[user_id].status = status
+            self.save_data()
     
     def delete_order(self, user_id: int):
         """Delete order"""
         if user_id in self.user_orders:
             del self.user_orders[user_id]
+            self.save_data()
     
     def ban_user(self, user_id: int):
         """Ban a user"""
         self.banned_users.add(user_id)
+        self.save_data()
+        logger.info(f"User {user_id} banned")
     
     def unban_user(self, user_id: int):
         """Unban a user"""
         if user_id in self.banned_users:
             self.banned_users.remove(user_id)
+            self.save_data()
+            logger.info(f"User {user_id} unbanned")
     
     def is_banned(self, user_id: int) -> bool:
         """Check if user is banned"""
@@ -160,9 +194,18 @@ class InMemoryDataManager:
             'banned_users': len(self.banned_users)
         }
 
-# ==================== GLOBAL APPLICATION STATE ====================
-data_manager = InMemoryDataManager()
-application: Optional[Application] = None
+# ==================== INITIALIZE DATA MANAGER ====================
+data_manager = DataManager()
+
+# ==================== ENHANCED LOGGING ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot_operations.log', encoding='utf-8')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # ==================== HELPER FUNCTIONS ====================
@@ -242,6 +285,7 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def build_admin_main_keyboard() -> InlineKeyboardMarkup:
+    """Admin main panel with ONLY pending orders and ban/unban options"""
     keyboard = [
         [InlineKeyboardButton("📋 Pending Orders", callback_data="admin_pending")],
         [InlineKeyboardButton("🚫 | ✅ Ban/Unban User", callback_data="admin_ban_panel")],
@@ -250,6 +294,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def build_ban_panel_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard for ban/unban panel"""
     keyboard = [
         [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user")],
         [InlineKeyboardButton("✅ Unban User", callback_data="admin_unban_user")],
@@ -321,7 +366,11 @@ Send **ONE clear screenshot** showing:
 
 # ==================== MAIN HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command"""
     user = update.effective_user
+    
+    # Load data on start
+    data_manager.load_data()
     
     if is_admin(user.id):
         await update.message.reply_text(
@@ -331,6 +380,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     
+    # Check if user is banned
     if data_manager.is_banned(user.id):
         await update.message.reply_text(
             "🚫 **Your account is banned!**\n\n"
@@ -340,6 +390,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     
+    # Clear any terminal state orders
     if user.id in data_manager.user_orders and data_manager.user_orders[user.id].status in [
         OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.COMPLETED
     ]:
@@ -348,10 +399,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await show_user_interface(update, context)
 
 async def show_user_interface(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user interface (product selection)"""
     user = update.effective_user
     
+    # Check if user can create new order
     can_create, reason = can_create_order(user.id)
     if not can_create:
+        # Create a keyboard with cancel button
         keyboard = [[InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_order")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -369,6 +423,7 @@ async def show_user_interface(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle product selection"""
     query = update.callback_query
     await query.answer()
     
@@ -381,6 +436,7 @@ async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("❌ Invalid selection.")
         return
     
+    # Create or update order
     if user.id not in data_manager.user_orders:
         order = Order(
             user_id=user.id,
@@ -396,6 +452,7 @@ async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT
         data_manager.user_orders[user.id].product = product
         data_manager.user_orders[user.id].amount = product.value['price']
         data_manager.user_orders[user.id].status = OrderStatus.INIT
+        data_manager.save_data()
     
     await query.edit_message_text(
         f"🎯 **Selected:** {product.value['emoji']} {product.value['name']}\n"
@@ -407,6 +464,7 @@ async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT
     )
 
 async def handle_network_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle network selection"""
     query = update.callback_query
     await query.answer()
     
@@ -428,6 +486,7 @@ async def handle_network_selection(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("❌ Session expired. Start over with /start")
         return
     
+    # Parse network
     if query.data.startswith("network_"):
         network_type = query.data.replace("network_", "")
         wallet_key = f"USDT_{network_type}"
@@ -436,8 +495,10 @@ async def handle_network_selection(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text("❌ Network unavailable.")
             return
         
+        # Update order
         data_manager.user_orders[user.id].network = wallet_key
         data_manager.user_orders[user.id].status = OrderStatus.AWAIT_PAYMENT
+        data_manager.save_data()
         
         wallet_address = WALLETS[wallet_key]
         
@@ -453,9 +514,11 @@ async def handle_network_selection(update: Update, context: ContextTypes.DEFAULT
             reply_markup=build_payment_keyboard()
         )
     else:
+        # Fallback for unknown callback
         await query.edit_message_text("❌ Unknown action. Please start over with /start")
 
 async def handle_payment_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show payment help"""
     query = update.callback_query
     await query.answer()
     
@@ -477,6 +540,7 @@ async def handle_payment_help(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def handle_upload_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch to screenshot upload mode"""
     query = update.callback_query
     await query.answer()
     
@@ -490,6 +554,7 @@ async def handle_upload_screenshot(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("⚠️ Invalid action in current state.")
         return
     
+    # Set screenshot expectation
     context.user_data['expecting_screenshot'] = True
     context.user_data['screenshot_time'] = time.time()
     
@@ -504,6 +569,7 @@ async def handle_upload_screenshot(update: Update, context: ContextTypes.DEFAULT
     )
 
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process uploaded screenshot"""
     if not context.user_data.get('expecting_screenshot', False):
         return
     
@@ -514,29 +580,36 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop('expecting_screenshot', None)
         return
     
+    # Check timeout
     screenshot_time = context.user_data.get('screenshot_time', 0)
     if time.time() - screenshot_time > SCREENSHOT_TIMEOUT:
         await update.message.reply_text("⚠️ Screenshot upload timeout. Restart process.")
         context.user_data.pop('expecting_screenshot', None)
         return
     
+    # Validate only one screenshot
     order = data_manager.user_orders[user.id]
     if order.screenshot_id:
         await update.message.reply_text("⚠️ Screenshot already submitted.")
         return
     
+    # Get photo
     if not update.message.photo:
         await update.message.reply_text("❌ Please send a valid image.")
         return
     
     photo = update.message.photo[-1]
     
+    # Update order
     data_manager.user_orders[user.id].screenshot_id = photo.file_id
     data_manager.user_orders[user.id].status = OrderStatus.UNDER_REVIEW
+    data_manager.save_data()
     
+    # Clear expectation flag
     context.user_data.pop('expecting_screenshot', None)
     context.user_data.pop('screenshot_time', None)
     
+    # Notify user
     await update.message.reply_text(
         "✅ **Screenshot Received!**\n\n"
         "Your payment is now under review.\n"
@@ -547,6 +620,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=ReplyKeyboardRemove()
     )
     
+    # Alert admins
     admin_message = (
         f"🚨 **NEW PAYMENT SUBMISSION**\n\n"
         f"**User:** @{order.username} (ID: `{order.user_id}`)\n"
@@ -571,11 +645,15 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
+    
+    logger.info(f"Screenshot received from user {user.id}")
 
 async def handle_cancel_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show cancellation confirmation"""
     query = update.callback_query if update.callback_query else None
     user = update.effective_user
     
+    # Handle command-based cancellation
     if user.id not in data_manager.user_orders:
         if query:
             await query.edit_message_text("❌ No active order to cancel.")
@@ -615,6 +693,7 @@ async def handle_cancel_confirmation(update: Update, context: ContextTypes.DEFAU
         )
 
 async def handle_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process cancel confirmation"""
     query = update.callback_query
     await query.answer()
     
@@ -622,11 +701,15 @@ async def handle_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if query.data == "confirm_cancel":
         if user.id in data_manager.user_orders:
+            # Clean up admin pending if exists
             for admin_id, pending_user in list(data_manager.admin_pending.items()):
                 if pending_user == user.id:
                     del data_manager.admin_pending[admin_id]
             
+            # Update order status
             data_manager.update_order_status(user.id, OrderStatus.CANCELLED)
+            
+            # Clear the order from storage
             data_manager.delete_order(user.id)
             
             await query.edit_message_text(
@@ -636,10 +719,12 @@ async def handle_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Start New Order", callback_data="user_start")]])
             )
+            logger.info(f"Order cancelled for user {user.id}")
         else:
             await query.edit_message_text("❌ No active order.")
     
     elif query.data == "keep_order":
+        # Go back to current state
         if user.id in data_manager.user_orders:
             order = data_manager.user_orders[user.id]
             if order.status == OrderStatus.INIT:
@@ -684,6 +769,7 @@ async def handle_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ==================== ADMIN HANDLERS ====================
 async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle admin accept/reject decisions"""
     query = update.callback_query
     await query.answer()
     
@@ -695,6 +781,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     
+    # Parse action and user_id
     if query.data.startswith("admin_accept_"):
         user_id = int(query.data.replace("admin_accept_", ""))
         action = "accept"
@@ -708,6 +795,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     
+    # Get order
     if user_id not in data_manager.user_orders:
         try:
             await query.edit_message_text("❌ Order no longer exists.")
@@ -733,9 +821,11 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if action == "accept":
+        # Lock order for this admin
         data_manager.admin_pending[admin.id] = user_id
         
         try:
+            # If message has caption (image)
             await query.edit_message_caption(
                 caption=f"✅ **ACCEPTED** - Order for user {user_id}\n\n"
                        f"**User:** @{order.username}\n"
@@ -746,6 +836,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
+            # If normal text message
             try:
                 await query.edit_message_text(
                     f"✅ **ACCEPTED** - Order for user {user_id}\n\n"
@@ -757,6 +848,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception as e2:
+                # If all fails, send new message
                 await context.bot.send_message(
                     chat_id=admin.id,
                     text=f"✅ **ACCEPTED** - Order for user {user_id}\n\n"
@@ -768,6 +860,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.MARKDOWN
                 )
         
+        # Notify user
         await context.bot.send_message(
             chat_id=user_id,
             text="🎉 **Payment Approved!**\n\n"
@@ -779,9 +872,11 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
         
     elif action == "reject":
+        # Update order status
         data_manager.update_order_status(user_id, OrderStatus.REJECTED)
         
         try:
+            # If message has caption (image)
             await query.edit_message_caption(
                 caption=f"❌ **REJECTED** - Order for user {user_id}\n\n"
                        f"**User:** @{order.username}\n"
@@ -789,6 +884,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
+            # If normal text message
             try:
                 await query.edit_message_text(
                     f"❌ **REJECTED** - Order for user {user_id}\n\n"
@@ -797,6 +893,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception as e2:
+                # If all fails, send new message
                 await context.bot.send_message(
                     chat_id=admin.id,
                     text=f"❌ **REJECTED** - Order for user {user_id}\n\n"
@@ -805,6 +902,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.MARKDOWN
                 )
         
+        # Notify user
         await context.bot.send_message(
             chat_id=user_id,
             text="⚠️ **Payment Review Result**\n\n"
@@ -822,6 +920,7 @@ async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 async def handle_admin_code_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process admin's code submission"""
     admin = update.effective_user
     
     if not is_admin(admin.id) or admin.id not in data_manager.admin_pending:
@@ -840,11 +939,13 @@ async def handle_admin_code_submission(update: Update, context: ContextTypes.DEF
         del data_manager.admin_pending[admin.id]
         return
     
+    # Get and sanitize code
     code = sanitize_text(update.message.text.strip())
     if not code or len(code) < 4:
         await update.message.reply_text("❌ Invalid code. Minimum 4 characters.")
         return
     
+    # Send code to user
     try:
         await context.bot.send_message(
             chat_id=user_id,
@@ -859,9 +960,13 @@ async def handle_admin_code_submission(update: Update, context: ContextTypes.DEF
             parse_mode=ParseMode.MARKDOWN
         )
         
+        # Update order status
         data_manager.update_order_status(user_id, OrderStatus.COMPLETED)
+        
+        # Cleanup
         del data_manager.admin_pending[admin.id]
         
+        # Confirm to admin
         await update.message.reply_text(
             f"✅ **CODE DELIVERED**\n\n"
             f"User: @{order.username}\n"
@@ -875,7 +980,9 @@ async def handle_admin_code_submission(update: Update, context: ContextTypes.DEF
         logger.error(f"Failed to send code to user {user_id}: {e}")
         await update.message.reply_text(f"❌ Failed to deliver code: {str(e)[:100]}")
 
+# ==================== ENHANCED ADMIN PANEL ====================
 async def handle_admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show pending orders to admin"""
     query = update.callback_query
     await query.answer()
     
@@ -894,7 +1001,7 @@ async def handle_admin_pending(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     message = "📋 **PENDING ORDERS**\n\n"
-    for i, order in enumerate(pending_orders[:10], 1):
+    for i, order in enumerate(pending_orders[:10], 1):  # Limit to 10 orders
         time_ago = format_time(time.time() - order.created_at)
         message += (
             f"**{i}. User:** @{order.username} (ID: `{order.user_id}`)\n"
@@ -916,6 +1023,7 @@ async def handle_admin_pending(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def handle_admin_ban_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show ban/unban panel"""
     query = update.callback_query
     await query.answer()
     
@@ -931,6 +1039,7 @@ async def handle_admin_ban_panel(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def handle_admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Initiate ban user process"""
     query = update.callback_query
     await query.answer()
     
@@ -938,6 +1047,7 @@ async def handle_admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Unauthorized.")
         return
     
+    # Set state for user ID input
     context.user_data['awaiting_ban_user_id'] = True
     
     await query.edit_message_text(
@@ -953,6 +1063,7 @@ async def handle_admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def handle_admin_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Initiate unban user process"""
     query = update.callback_query
     await query.answer()
     
@@ -960,6 +1071,7 @@ async def handle_admin_unban_user(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ Unauthorized.")
         return
     
+    # Set state for user ID input
     context.user_data['awaiting_unban_user_id'] = True
     
     await query.edit_message_text(
@@ -972,6 +1084,7 @@ async def handle_admin_unban_user(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def handle_admin_banned_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show list of banned users"""
     query = update.callback_query
     await query.answer()
     
@@ -1000,6 +1113,7 @@ async def handle_admin_banned_list(update: Update, context: ContextTypes.DEFAULT
     )
 
 async def handle_admin_user_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle admin input for user ID (ban/unban)"""
     admin = update.effective_user
     
     if not is_admin(admin.id):
@@ -1015,6 +1129,7 @@ async def handle_admin_user_id_input(update: Update, context: ContextTypes.DEFAU
         )
         return
     
+    # Handle ban
     if context.user_data.get('awaiting_ban_user_id'):
         context.user_data.pop('awaiting_ban_user_id', None)
         
@@ -1025,6 +1140,7 @@ async def handle_admin_user_id_input(update: Update, context: ContextTypes.DEFAU
         else:
             data_manager.ban_user(user_id)
             
+            # Cancel any active orders for this user
             if user_id in data_manager.user_orders:
                 data_manager.update_order_status(user_id, OrderStatus.CANCELLED)
             
@@ -1037,6 +1153,7 @@ async def handle_admin_user_id_input(update: Update, context: ContextTypes.DEFAU
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="admin_ban_panel")]])
             )
     
+    # Handle unban
     elif context.user_data.get('awaiting_unban_user_id'):
         context.user_data.pop('awaiting_unban_user_id', None)
         
@@ -1053,9 +1170,11 @@ async def handle_admin_user_id_input(update: Update, context: ContextTypes.DEFAU
             )
 
 async def handle_admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Go back to admin main menu"""
     query = update.callback_query
     await query.answer()
     
+    # Clear any input states
     context.user_data.pop('awaiting_ban_user_id', None)
     context.user_data.pop('awaiting_unban_user_id', None)
     
@@ -1066,16 +1185,19 @@ async def handle_admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 async def handle_admin_user_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch to user mode"""
     query = update.callback_query
     await query.answer()
     
     user = update.effective_user
     
+    # Clear any terminal state orders
     if user.id in data_manager.user_orders and data_manager.user_orders[user.id].status in [
         OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.COMPLETED
     ]:
         data_manager.delete_order(user.id)
     
+    # Check if user can create new order
     can_create, reason = can_create_order(user.id)
     if not can_create:
         keyboard = [[InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_order")]]
@@ -1095,16 +1217,19 @@ async def handle_admin_user_mode(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def handle_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle user start from callback"""
     query = update.callback_query
     await query.answer()
     
     user = update.effective_user
     
+    # Clear any terminal state orders
     if user.id in data_manager.user_orders and data_manager.user_orders[user.id].status in [
         OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.COMPLETED
     ]:
         data_manager.delete_order(user.id)
     
+    # Check if user can create new order
     can_create, reason = can_create_order(user.id)
     if not can_create:
         keyboard = [[InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_order")]]
@@ -1125,6 +1250,7 @@ async def handle_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ==================== ADDITIONAL COMMANDS ====================
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user ID"""
     user = update.effective_user
     await update.message.reply_text(
         f"🆔 **Your ID:** `{user.id}`\n"
@@ -1134,6 +1260,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot statistics for admin"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Unauthorized.")
         return
@@ -1148,12 +1275,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"**Pending:** {stats['pending']}\n"
         f"**Currently Active:** {stats['active']}\n"
         f"**Banned Users:** {stats['banned_users']}\n\n"
-        f"**Data Storage:** In-Memory (Stateless)"
+        f"**Data Saved:** Yes"
     )
     
     await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
+# ==================== FIXED HANDLERS ====================
 async def handle_direct_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle direct cancel button clicks"""
     query = update.callback_query
     if not query:
         return
@@ -1162,6 +1291,7 @@ async def handle_direct_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     await handle_cancel_confirmation(update, context)
 
 async def handle_unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle unknown callback queries"""
     query = update.callback_query
     await query.answer("⚠️ Unknown action. Please use the buttons provided.", show_alert=False)
     
@@ -1198,119 +1328,112 @@ async def handle_unknown_callback(update: Update, context: ContextTypes.DEFAULT_
 
 # ==================== ERROR HANDLER ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler"""
     logger.error(f"Exception: {context.error}", exc_info=context.error)
+    
+    try:
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ An error occurred. Please try again."
+            )
+    except:
+        pass
 
-# ==================== WEBHOOK SETUP ====================
-def create_application() -> Application:
-    """Create and configure the Telegram bot application"""
-    app = Application.builder().token(BOT_TOKEN).build()
+# ==================== MAIN APPLICATION ====================
+def main() -> None:
+    """Initialize and run the bot"""
+    
+    # Validate configuration
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ERROR: Set BOT_TOKEN in configuration")
+        exit(1)
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Load existing data
+    data_manager.load_data()
     
     # ===== USER HANDLERS =====
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("cancel", handle_cancel_confirmation))
-    app.add_handler(CommandHandler("id", id_command))
-    app.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("cancel", handle_cancel_confirmation))
+    application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     
     # Callback query handlers
-    app.add_handler(CallbackQueryHandler(handle_product_selection, pattern=r"^product_"))
-    app.add_handler(CallbackQueryHandler(handle_network_selection, pattern=r"^(network_|back_to_products|cancel_order)"))
-    app.add_handler(CallbackQueryHandler(handle_payment_help, pattern=r"^payment_help$"))
-    app.add_handler(CallbackQueryHandler(handle_upload_screenshot, pattern=r"^upload_screenshot$"))
-    app.add_handler(CallbackQueryHandler(handle_cancel_action, pattern=r"^(confirm_cancel|keep_order)$"))
-    app.add_handler(CallbackQueryHandler(handle_direct_cancel, pattern=r"^cancel_order$"))
-    app.add_handler(CallbackQueryHandler(handle_user_start, pattern=r"^user_start$"))
+    application.add_handler(CallbackQueryHandler(handle_product_selection, pattern=r"^product_"))
+    application.add_handler(CallbackQueryHandler(handle_network_selection, pattern=r"^(network_|back_to_products|cancel_order)"))
+    application.add_handler(CallbackQueryHandler(handle_payment_help, pattern=r"^payment_help$"))
+    application.add_handler(CallbackQueryHandler(handle_upload_screenshot, pattern=r"^upload_screenshot$"))
+    application.add_handler(CallbackQueryHandler(handle_cancel_action, pattern=r"^(confirm_cancel|keep_order)$"))
+    application.add_handler(CallbackQueryHandler(handle_direct_cancel, pattern=r"^cancel_order$"))
+    application.add_handler(CallbackQueryHandler(handle_user_start, pattern=r"^user_start$"))
     
     # Admin callback handlers
-    app.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^admin_(accept|reject)_"))
-    app.add_handler(CallbackQueryHandler(handle_admin_pending, pattern=r"^admin_pending$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_ban_panel, pattern=r"^admin_ban_panel$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_ban_user, pattern=r"^admin_ban_user$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_unban_user, pattern=r"^admin_unban_user$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_banned_list, pattern=r"^admin_banned_list$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_back, pattern=r"^admin_back$"))
-    app.add_handler(CallbackQueryHandler(handle_admin_user_mode, pattern=r"^admin_user_mode$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_decision, pattern=r"^admin_(accept|reject)_"))
+    application.add_handler(CallbackQueryHandler(handle_admin_pending, pattern=r"^admin_pending$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_ban_panel, pattern=r"^admin_ban_panel$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_ban_user, pattern=r"^admin_ban_user$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_unban_user, pattern=r"^admin_unban_user$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_banned_list, pattern=r"^admin_banned_list$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_back, pattern=r"^admin_back$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_user_mode, pattern=r"^admin_user_mode$"))
     
-    # Unknown callback handler
-    app.add_handler(CallbackQueryHandler(handle_unknown_callback))
+    # Unknown callback handler (catch-all)
+    application.add_handler(CallbackQueryHandler(handle_unknown_callback))
     
     # Message handlers
-    app.add_handler(MessageHandler(
+    application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & 
         filters.User(ADMIN_CHAT_IDS),
         handle_admin_code_submission
     ))
     
     # Admin user ID input handler
-    app.add_handler(MessageHandler(
+    application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & 
         filters.User(ADMIN_CHAT_IDS),
         handle_admin_user_id_input
     ))
     
-    app.add_handler(MessageHandler(
+    application.add_handler(MessageHandler(
         filters.PHOTO & filters.ChatType.PRIVATE,
         handle_screenshot
     ))
     
     # Error handler
-    app.add_error_handler(error_handler)
+    application.add_error_handler(error_handler)
     
-    return app
-
-# ==================== FASTAPI APP ====================
-fastapi_app = FastAPI(title="Telegram Bot Webhook")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize and cleanup bot application"""
-    global application
-    application = create_application()
-    await application.initialize()
-    await application.start()
-    logger.info("Bot application started")
-    yield
-    await application.stop()
-    await application.shutdown()
-    logger.info("Bot application stopped")
-
-fastapi_app = FastAPI(lifespan=lifespan)
-
-@fastapi_app.post("/webhook")
-async def webhook(request: Request) -> JSONResponse:
-    """Handle Telegram webhook updates"""
+    # Start bot
+    print("\n" + "="*60)
+    print("✨ SUBSCRIPTION BOT - ENHANCED VERSION ✨")
+    print("="*60)
+    print("\n✅ ENHANCED FEATURES:")
+    print("• Automatic data persistence ✓")
+    print("• User ban/unban system ✓")
+    print("• Simplified admin panel (pending orders + ban/unban) ✓")
+    print("• Banned users list ✓")
+    print("• /id command to show user ID ✓")
+    print("• /stats command to show statistics ✓")
+    print("• Improved user interface ✓")
+    print("\n🤖 Starting bot...")
+    print("="*60 + "\n")
+    
     try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        
-        # Process update
-        await application.process_update(update)
-        
-        return JSONResponse(content={"status": "ok"})
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return JSONResponse(
-            content={"status": "error", "message": str(e)},
-            status_code=500
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
         )
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+        # Save data before exit
+        data_manager.save_data()
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        print(f"💥 Bot crashed: {e}")
+        # Save data before crash
+        data_manager.save_data()
 
-@fastapi_app.get("/health")
-async def health_check() -> JSONResponse:
-    """Health check endpoint"""
-    return JSONResponse(content={"status": "healthy", "bot": "running"})
-
-# ==================== MAIN ENTRY POINT ====================
 if __name__ == "__main__":
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-    
-    port = int(os.getenv("PORT", "8080"))
-    host = os.getenv("HOST", "0.0.0.0")
-    
-    uvicorn.run(
-        "bot:fastapi_app",
-        host=host,
-        port=port,
-        reload=False
-    )
+    main()
